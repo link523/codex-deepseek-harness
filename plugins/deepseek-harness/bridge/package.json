@@ -1,0 +1,29 @@
+{
+  "name": "dsh-codex-bridge",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Authenticated local task and conversation bridge for the DeepSeek Harness desktop app",
+  "license": "MIT",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "*.mjs",
+    "cordis.patch.yml"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "codex"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

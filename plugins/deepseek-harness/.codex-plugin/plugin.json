@@ -1,0 +1,13 @@
+{
+  "name": "deepseek-harness",
+  "version": "0.2.0",
+  "description": "Control the DeepSeek Harness desktop app and sync linked conversations without screen automation.",
+  "requires_local_executor": true,
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "DeepSeek Harness",
+    "shortDescription": "控制桌面 App、执行任务并同步对话"
+  }
+}

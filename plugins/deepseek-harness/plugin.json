@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "deepseek-harness",
+  "version": "0.2.0",
+  "description": "Control the DeepSeek Harness desktop app and sync linked conversations without screen automation.",
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "hooks": "./hooks/hooks.json",
+      "interface": {
+        "displayName": "DeepSeek Harness",
+        "shortDescription": "控制桌面 App、执行任务并同步对话",
+        "defaultPrompt": "让 DeepSeek Harness 在指定项目中执行任务，并把结果同步到当前对话。"
+      }
+    }
+  }
+}

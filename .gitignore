@@ -1,0 +1,5 @@
+dist/
+*.tgz
+*.log
+node_modules/
+.upstream-tree.json
