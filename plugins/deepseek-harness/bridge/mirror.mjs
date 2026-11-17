@@ -41,30 +41,105 @@ function messageText(content) {
 // tool traffic stay in Codex so the DeepSeek history keeps the same shape as a
 // normal chat. User records must carry the `user.text` kind because Codex also
 // writes environment context as a `user` role message.
-export function transcriptMessages(lines) {
+function parseJson(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function planSteps(value) {
+  const plan = Array.isArray(value) ? value : value?.plan ?? value?.steps ?? value?.todos;
+  if (!Array.isArray(plan)) return null;
+  const todos = [];
+  for (const step of plan) {
+    if (typeof step === 'string') {
+      if (step.trim()) todos.push({ content: step, status: 'pending' });
+      continue;
+    }
+    const content = step?.step ?? step?.content ?? step?.text;
+    if (typeof content !== 'string' || !content.trim()) continue;
+    const status = ['pending', 'in_progress', 'completed'].includes(step?.status) ? step.status : 'pending';
+    todos.push({ content, status });
+  }
+  return Array.isArray(plan) ? todos : null;
+}
+
+function collaborationMode(payload) {
+  const mode = payload?.thread_settings?.collaboration_mode?.mode
+    ?? payload?.collaboration_mode?.mode
+    ?? payload?.collaboration_mode_kind
+    ?? payload?.thread_settings?.collaboration_mode_kind;
+  if (mode === 'plan') return true;
+  if (mode === 'default' || mode === 'normal') return false;
+  return undefined;
+}
+
+// Parse one rollout chunk into the pieces the DeepSeek conversation can show:
+// chat messages, the latest plan/todo snapshot, and the Codex model in use.
+export function transcriptRecords(lines) {
   const messages = [];
+  let planMode;
+  let todos;
+  let model;
   for (const line of lines) {
     if (!line) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
-    if (record?.type !== 'response_item' || record.payload?.type !== 'message') continue;
-    const payload = record.payload;
-    const role = payload.role;
-    if (role !== 'user' && role !== 'assistant') continue;
-    const metadata = payload.internal_chat_message_metadata_passthrough ?? {};
-    const kinds = Array.isArray(metadata.content_item_kinds) ? metadata.content_item_kinds : [];
-    if (role === 'user' && kinds.length && !kinds.includes('user.text')) continue;
-    if (role === 'assistant' && kinds.includes('hooks.additional_context')) continue;
-    let text = messageText(payload.content);
-    if (!text) continue;
-    if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
-    const id = typeof payload.id === 'string' && payload.id
-      ? payload.id
-      : `codex-${digest(`${record.timestamp ?? ''}|${text}`).slice(0, 24)}`;
-    const turnId = typeof metadata.turn_id === 'string' && metadata.turn_id ? metadata.turn_id : undefined;
-    messages.push({ id, role, text, ...(turnId ? { turnId } : {}) });
+    const payload = record?.payload;
+    if (!payload) continue;
+    if (record.type === 'response_item') {
+      if (payload.type === 'message') {
+        const role = payload.role;
+        if (role !== 'user' && role !== 'assistant') continue;
+        const metadata = payload.internal_chat_message_metadata_passthrough ?? {};
+        const kinds = Array.isArray(metadata.content_item_kinds) ? metadata.content_item_kinds : [];
+        if (role === 'user' && kinds.length && !kinds.includes('user.text')) continue;
+        if (role === 'assistant' && kinds.includes('hooks.additional_context')) continue;
+        let text = messageText(payload.content);
+        if (!text) continue;
+        if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
+        const id = typeof payload.id === 'string' && payload.id
+          ? payload.id
+          : `codex-${digest(`${record.timestamp ?? ''}|${text}`).slice(0, 24)}`;
+        const turnId = typeof metadata.turn_id === 'string' && metadata.turn_id ? metadata.turn_id : undefined;
+        messages.push({ id, role, text, ...(turnId ? { turnId } : {}) });
+        continue;
+      }
+      if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+        if (payload.name === 'update_plan') {
+          const next = planSteps(parseJson(payload.arguments ?? payload.input));
+          if (next) todos = next;
+        }
+        continue;
+      }
+      continue;
+    }
+    if (record.type === 'event_msg') {
+      const mode = collaborationMode(payload);
+      if (mode !== undefined) planMode = mode;
+      if (payload.type === 'item_completed') {
+        const item = payload.item;
+        if (item?.type === 'Plan' || item?.type === 'plan') {
+          const next = planSteps(item);
+          if (next) todos = next;
+        }
+      }
+      if (payload.type === 'thread_settings_applied' || payload.type === 'task_started') {
+        const candidate = payload.thread_settings?.model ?? payload.model;
+        if (typeof candidate === 'string' && candidate) model = candidate;
+      }
+      continue;
+    }
+    if (record.type === 'turn_context') {
+      const mode = collaborationMode(payload);
+      if (mode !== undefined) planMode = mode;
+      if (typeof payload.model === 'string' && payload.model) model = payload.model;
+    }
   }
-  return messages;
+  return { messages, planMode, todos, model };
+}
+
+export function transcriptMessages(lines) {
+  return transcriptRecords(lines).messages;
 }
 
 async function readLinks(root) {
@@ -124,6 +199,7 @@ export function createMirrorWatcher(adapter, options = {}) {
   const logger = options.logger;
   const ctx = options.ctx;
   const state = new Map(); // mirrorKey(link) -> { path, offset }
+  let capabilities = null;
   let timer = null;
   let ticking = false;
   let stopped = false;
@@ -151,7 +227,7 @@ export function createMirrorWatcher(adapter, options = {}) {
     if (info.size === mirror.offset) return;
     const handle = await open(mirror.path, 'r');
     let consumed = 0;
-    let messages = [];
+    let records = { messages: [], planMode: undefined, todos: undefined };
     try {
       const length = info.size - mirror.offset;
       const buffer = Buffer.alloc(length);
@@ -161,14 +237,45 @@ export function createMirrorWatcher(adapter, options = {}) {
       if (end < 0) return; // Wait for a complete line; the next tick retries.
       const chunk = text.slice(0, end + 1);
       consumed = Buffer.byteLength(chunk, 'utf8');
-      messages = transcriptMessages(chunk.split('\n'));
+      records = transcriptRecords(chunk.split('\n'));
     } finally { await handle.close(); }
     // Keep the offset on failure so the same records are retried next tick.
-    for (let index = 0; index < messages.length; index += MAX_BATCH) {
-      await adapter.call('mirror', { sessionId: link.sessionId, messages: messages.slice(index, index + MAX_BATCH) });
+    // Plan/todo snapshots are level-triggered in the rollout, so compare with
+    // what this link already delivered. Otherwise a user toggling plan mode in
+    // DeepSeek would be overwritten on every poll while Codex stays in plan.
+    const planKnown = mirror.plan !== undefined;
+    const planChanged = records.planMode !== undefined && records.planMode !== mirror.plan;
+    const todosChanged = records.todos !== undefined
+      && JSON.stringify(records.todos) !== JSON.stringify(mirror.todos);
+    const batches = [];
+    for (let index = 0; index < records.messages.length; index += MAX_BATCH) {
+      batches.push(records.messages.slice(index, index + MAX_BATCH));
     }
+    if (!batches.length && (planChanged || todosChanged)) batches.push([]);
+    for (let index = 0; index < batches.length; index++) {
+      const args = { sessionId: link.sessionId, messages: batches[index] };
+      if (index === 0) {
+        // An older companion build ignores unknown fields at best and rejects
+        // them at worst; only send plan/todo payloads it advertises.
+        if (planChanged && (planKnown || records.planMode === true) && await supports('plan')) {
+          args.planMode = records.planMode;
+        }
+        if (todosChanged && await supports('todos')) args.todos = records.todos;
+      }
+      await adapter.call('mirror', args);
+    }
+    mirror.plan = records.planMode ?? mirror.plan;
+    mirror.todos = records.todos ?? mirror.todos;
     mirror.offset += consumed;
     await writeState(root, key, mirror);
+  }
+
+  async function supports(capability) {
+    if (!capabilities) {
+      try { capabilities = new Set((await adapter.call('health')).capabilities ?? []); }
+      catch { capabilities = new Set(); }
+    }
+    return capabilities.has(capability);
   }
 
   async function tick() {

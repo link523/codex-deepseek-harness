@@ -3,7 +3,7 @@
   "mcpServers": {
     "deepseek_harness": {
       "type": "stdio",
-      "command": "node",
+      "command": "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node",
       "args": [
         "${PLUGIN_ROOT}/server/index.mjs"
       ],

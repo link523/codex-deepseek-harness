@@ -161,3 +161,21 @@ test('actual desktop assistant envelope omits provider stream and reasoning', as
   assert.equal(result.entries[0].data.content[0].text, 'visible answer');
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE_STREAM|hidden/);
 });
+
+test('transcript method returns Markdown without mirrored records', async t => {
+  const e = await environment(t);
+  const { sessionId } = await e.client.call('create', { cwd: e.dir, title: 'Shared chat' });
+  e.append(sessionId, 'user/message', { content: [{ type: 'text', text: 'hello from DeepSeek' }] });
+  e.append(sessionId, 'assistant/message', { turn: 1, step: 1, stream: [],
+    message: { content: [{ type: 'text', text: 'hello from the model' }] } });
+  e.append(sessionId, 'user/message', { content: [{ type: 'text', text: 'mirrored prompt' }], source: { mirror: 'codex' } });
+  e.append(sessionId, 'plan/mode', { active: true });
+  e.append(sessionId, 'todo/write', { todos: [{ content: 'ship it', status: 'in_progress' }] });
+  const result = await e.client.call('transcript', { sessionId });
+  assert.match(result.markdown, /hello from DeepSeek/);
+  assert.match(result.markdown, /hello from the model/);
+  assert.match(result.markdown, /Plan mode:\*\* active/);
+  assert.match(result.markdown, /ship it/);
+  assert.doesNotMatch(result.markdown, /mirrored prompt/);
+  assert.equal(result.truncated, false);
+});

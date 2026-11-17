@@ -1,6 +1,6 @@
 # Codex ↔ DeepSeek Harness Desktop
 
-通过 **Codex 插件 + DeepSeek 桌面扩展**，让 Codex 在真正的 DeepSeek Harness App 会话中下发任务、发送后续消息、等待结果、取消当前任务并同步对话。适配 Windows 和 macOS，不使用截图、鼠标键盘控制、辅助功能接口或浏览器调试端口。
+通过 **Codex 插件 + DeepSeek 桌面扩展**，让 Codex 在真正的 DeepSeek Harness App 会话中下发任务、发送后续消息、等待结果、取消当前任务并同步对话。DSH 会话还会以 MCP resources 暴露给 Codex，支持按工作区自动关联、计划/待办镜像。适配 Windows 和 macOS，不使用截图、鼠标键盘控制、辅助功能接口或浏览器调试端口。
 
 当前版本：`0.2.0`。无第三方运行依赖，需要 Node.js **22.19+ 或 24+**、支持本地插件的 Codex，以及已完成初始化的官方 DeepSeek Harness 桌面 App。实现依据为本机桌面版 **0.2.1-rc.5** 的会话服务；扩展会检查必要接口，0.3 等后续版本需要重新确认兼容性。
 
@@ -30,7 +30,7 @@ node scripts/install.mjs --all
 
 1. 首次调用插件工具时，会自动打开 DeepSeek Harness 并等待桥接就绪；也可以自行打开 App。
 2. 重新启动 Codex，在插件目录的个人本地来源中安装 **DeepSeek Harness**。
-3. 在 Codex 提供的钩子信任审查中检查并信任 `UserPromptSubmit` 同步钩子。宿主未信任时，工具仍可手动同步，但下一条消息前的自动补齐不会运行。插件不会自行更改信任设置。
+3. 安装器会把 `UserPromptSubmit`、`SessionStart` 两个钩子写入用户级 `~/.codex/hooks.json`（保留已有钩子，改动前备份）。重启 Codex 后，在钩子信任审查中信任这两个钩子。Codex 当前只把用户级钩子列进信任审查，插件内的 `hooks/hooks.json` 不会单独显示。`UserPromptSubmit` 负责下一条消息前的增量补齐，`SessionStart` 负责自动关联。宿主未信任时，工具仍可手动同步，但自动关联不会运行。插件不会自行更改信任设置。
 4. 执行 `node scripts/install.mjs --doctor`，应看到 `companionInstalled: true` 和桥接能力信息。
 
 只安装一侧可用 `--deepseek` 或 `--codex`。App 在非默认位置时设置 `DSH_DESKTOP_PATH`：Windows 指向 `.exe`，macOS 指向 `.app`。用户目录通过系统接口获取，不硬编码用户名。
@@ -60,7 +60,26 @@ Codex 可以选择已有会话，或在指定项目里创建新会话。新建�
 | `dsh_sync` | 按事件游标读取新增消息，支持分页 |
 | `dsh_wait` | 本地等待完成、消息或需要输入 |
 | `dsh_cancel` | 取消当前任务；DeepSeek 会保留其排队消息 |
-| `dsh_bind` / `dsh_unbind` | 双向关联/解除：Codex 提示前拉取 DeepSeek 新消息，App 打开会话时镜像 Codex 记录 |
+| `dsh_bind` / `dsh_unbind` | 手动双向关联/解除；通常由自动关联完成 |
+| `dsh_transcript` | 读取完整 DSH 会话的 Markdown 全文，默认含工具摘要 |
+
+### 自动关联
+
+当 Codex 的钩子带上 `cwd` 且当前会话还没有关联时，插件会在 DSH 会话列表中查找同一工作区的会话：优先正在运行的，其次最近 30 分钟内更新的。只有候选唯一时才自动绑定；如果两个空闲会话的更新时间相差不到 60 秒，插件不会猜测，而是保持未关联，等你说“关联某个对话”后由 `dsh_bind` 明确指定。
+
+自动绑定使用 `fromStart: true`，因此 Codex 能立即读到该 DSH 会话此前的对话；`mirrorFromStart` 保持 `false`，不会把绑定前的大量 Codex 历史反向灌入 DSH。
+
+### 对话全文与 MCP resources
+
+`dsh_transcript` 把会话事件渲染成 Markdown：用户/助手消息、工具调用与结果摘要、计划与待办、模型选择。镜像自 Codex 的记录会被过滤，避免回环；工具输出默认截断到 2000 字符，可用 `includeTools: false` 只看对话。
+
+MCP 还暴露 `dsh://session/{sessionId}` resource：支持 resources 的客户端可以先 `resources/list` 发现会话，再 `resources/read` 直接取得同一份 Markdown。这样 Codex 不必只依赖增量 digest，也能按需读取完整对话。
+
+### 计划与待办镜像
+
+Codex → DSH：插件解析转录中的 `update_plan` 工具调用、`Plan` item，以及 `turn_context` / `thread_settings_applied` 里的 `collaboration_mode.mode`，向 DSH 追加 `plan/mode`、`todo/write` 事件；镜像助手消息的 source 记录 Codex 模型，但不会改写 DSH 自己的模型选择。重复的 plan/todo 快照会按最后值去重；只有 Codex 侧状态真正变化时才推送，所以在 DSH 里手动切换计划模式不会被下一轮轮询覆盖。
+
+DSH → Codex：`UserPromptSubmit` 注入的 Markdown digest 同样包含计划状态、待办列表和当前模型，Codex 不需要再调用工具就能看到这些变化。
 
 ## 自动打开桌面软件
 
@@ -121,7 +140,7 @@ node scripts/install.mjs --all --dry-run
 node scripts/install.mjs --doctor
 ```
 
-48 项测试覆盖长历史增量定位、等待快照次数、跨进程游标单调提交、关联切换与解除、连接目录隔离、响应体超时，以及本机 HTTP 鉴权、跨站拒绝、任务提交与重试、按序增量同步、分页、等待完成/超时/审批/取消、钩子与会话隔离、Codex 转录过滤与增量镜像、MCP JSONL 交互及两平台路径。测试使用隔离的模拟会话，不发送付费模型请求，也不会修改你的真实 DeepSeek 对话。GitHub Actions 已配置 Windows/macOS 与 Node 22/24 矩阵；本地 Windows 测试通过不代表 macOS 真机已验证。
+57 项测试覆盖长历史增量定位、等待快照次数、跨进程游标单调提交、关联切换与解除、连接目录隔离、响应体超时，以及本机 HTTP 鉴权、跨站拒绝、任务提交与重试、按序增量同步、分页、等待完成/超时/审批/取消、钩子与会话隔离、Codex 转录过滤与增量镜像、plan/todo 提取与去重、transcript Markdown、自动关联选择、MCP JSONL/resources 交互及两平台路径。测试使用隔离的模拟会话，不发送付费模型请求，也不会修改你的真实 DeepSeek 对话。GitHub Actions 已配置 Windows/macOS 与 Node 22/24 矩阵；本地 Windows 测试通过不代表 macOS 真机已验证。
 
 卸载时在 Codex 中移除插件；完全退出 DeepSeek Harness 后，用 App 提供的 `dsh plugin --profile desktop remove dsh-codex-bridge` 移除配套扩展。安装器没有替换你已有的 `dsh` 命令。
 

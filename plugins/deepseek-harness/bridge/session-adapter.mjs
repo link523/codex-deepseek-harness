@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, resolve } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
+import { formatTranscript } from './format.mjs';
 
 export class BridgeError extends Error {
   constructor(code, message) { super(message); this.code = code; }
@@ -25,7 +26,8 @@ export function integer(value, field, fallback, min, max) {
 
 // Never return provider request headers or private reasoning in a conversation sync.
 // Raw tool output is opt-in; it may be large and is unnecessary for ordinary waiting.
-const conversationTypes = new Set(['user/message', 'assistant/message', 'turn/start', 'turn/end', 'agent/error']);
+const conversationTypes = new Set(['user/message', 'assistant/message', 'turn/start', 'turn/end', 'agent/error',
+  'plan/mode', 'todo/write', 'model/selection']);
 const detailTypes = new Set(['tool/call', 'tool/result', 'assistant/attempt']);
 function cleanContent(content) {
   if (typeof content === 'string') return content;
@@ -45,6 +47,7 @@ function isMirrored(event) {
     return source?.mirror === 'codex' || source?.kind === 'codex';
   }
   if (event.type === 'assistant/message') return event.data?.message?.source?.provider === 'codex';
+  if (event.type === 'plan/mode' || event.type === 'todo/write') return event.data?.source === 'codex';
   return false;
 }
 function publicEvent(event, detail) {
@@ -71,7 +74,8 @@ export function createSessionAdapter(ctx) {
   // out of DSH -> Codex sync, which only needs the conversation content.
   const syntheticTurns = new Set();
   const isMirroredBoundary = event =>
-    (event.type === 'turn/start' || event.type === 'turn/end') && syntheticTurns.has(event.data?.turn);
+    (event.type === 'turn/start' || event.type === 'turn/end')
+    && (syntheticTurns.has(event.data?.turn) || event.data?.source === 'codex');
 
   async function snapshot(sessionId, signal) {
     signal.throwIfAborted();
@@ -149,6 +153,27 @@ export function createSessionAdapter(ctx) {
     return { sessionId, cursor, endSeq, hasMore: cursor < endSeq, entries, state: state(sessionId, value.events) };
   }
 
+  function transcriptOptions(args) {
+    const sessionId = string(args.sessionId, 'sessionId');
+    const maxChars = integer(args.maxChars, 'maxChars', 200000, 1000, 500000);
+    if (args.includeTools !== undefined && typeof args.includeTools !== 'boolean') invalid('includeTools must be boolean');
+    // Match incremental sync: tool output enters context only on explicit opt-in.
+    return { sessionId, maxChars, includeTools: args.includeTools === true };
+  }
+
+  // Read the whole linked conversation as one Markdown document. This is the
+  // resource surface Codex uses when it wants context rather than a cursor page.
+  async function transcript(args, signal) {
+    const { sessionId, maxChars, includeTools } = transcriptOptions(args);
+    const value = await snapshot(sessionId, signal);
+    const events = value.events.filter(event => !isMirrored(event) && !isMirroredBoundary(event));
+    const markdown = formatTranscript(events, { sessionId, header: value.header, includeTools, maxChars });
+    return {
+      sessionId, endSeq: value.events.at(-1)?.seq ?? -1, markdown,
+      truncated: markdown.includes('[transcript truncated at'), state: state(sessionId, value.events),
+    };
+  }
+
   async function wait(args, signal) {
     const { sessionId, afterSeq } = syncOptions(args);
     const timeoutMs = integer(args.timeoutMs, 'timeoutMs', 50000, 0, 600000);
@@ -220,11 +245,29 @@ export function createSessionAdapter(ctx) {
 
   function mirrorOptions(args) {
     const sessionId = string(args.sessionId, 'sessionId');
-    if (!Array.isArray(args.messages) || args.messages.length === 0 || args.messages.length > 100) {
-      invalid('messages must be a non-empty array with at most 100 items');
+    if (!Array.isArray(args.messages) || args.messages.length > 100) {
+      invalid('messages must be an array with at most 100 items');
     }
     const provider = args.provider === undefined ? 'codex' : string(args.provider, 'provider', 100);
     const model = args.model === undefined ? 'codex' : string(args.model, 'model', 200);
+    let planMode;
+    if (args.planMode !== undefined) {
+      if (typeof args.planMode !== 'boolean') invalid('planMode must be boolean');
+      planMode = args.planMode;
+    }
+    let todos;
+    if (args.todos !== undefined) {
+      if (!Array.isArray(args.todos) || args.todos.length > 100) invalid('todos must be an array with at most 100 items');
+      todos = args.todos.map((value, index) => {
+        const todo = object(value);
+        const status = todo.status ?? 'pending';
+        if (!['pending', 'in_progress', 'completed'].includes(status)) invalid(`todos[${index}].status must be pending, in_progress or completed`);
+        return { content: string(todo.content, `todos[${index}].content`, 1000), status };
+      });
+    }
+    if (args.messages.length === 0 && planMode === undefined && todos === undefined) {
+      invalid('messages must be a non-empty array with at most 100 items, unless planMode or todos is provided');
+    }
     const messages = args.messages.map((value, index) => {
       const message = object(value);
       if (message.role !== 'user' && message.role !== 'assistant') invalid(`messages[${index}].role must be user or assistant`);
@@ -235,7 +278,7 @@ export function createSessionAdapter(ctx) {
         turnId: message.turnId === undefined ? undefined : string(message.turnId, `messages[${index}].turnId`, 200),
       };
     });
-    return { sessionId, messages, provider, model };
+    return { sessionId, messages, provider, model, planMode, todos };
   }
 
   // Mirrored steps use numbers above any real step so a Codex record can never
@@ -270,7 +313,7 @@ export function createSessionAdapter(ctx) {
   // only renders an assistant message inside a started step; a conversation
   // without any turn gets one synthetic turn to hold the imported records.
   function mirror(args) {
-    const { sessionId, messages, provider, model } = mirrorOptions(args);
+    const { sessionId, messages, provider, model, planMode, todos } = mirrorOptions(args);
     const live = ctx.sessions.get(sessionId);
     if (!live) {
       throw new BridgeError('SESSION_NOT_LIVE', 'Open the DeepSeek conversation in the desktop app before its Codex records can be mirrored');
@@ -279,6 +322,22 @@ export function createSessionAdapter(ctx) {
       throw new BridgeError('INCOMPATIBLE_DSH', 'This Harness build cannot append mirrored records');
     }
     const events = live.snapshotEvents();
+    let planChanged = false;
+    if (planMode !== undefined) {
+      const lastPlan = [...events].reverse().find(event => event.type === 'plan/mode');
+      if (lastPlan?.data?.active !== planMode) {
+        live.append('plan/mode', { active: planMode, source: 'codex' });
+        planChanged = true;
+      }
+    }
+    let todosChanged = false;
+    if (todos !== undefined) {
+      const lastTodos = [...events].reverse().find(event => event.type === 'todo/write');
+      if (JSON.stringify(lastTodos?.data?.todos ?? []) !== JSON.stringify(todos)) {
+        live.append('todo/write', { todos, source: 'codex' });
+        todosChanged = true;
+      }
+    }
     const known = new Set();
     for (const event of events) {
       if (event.type === 'user/message' && typeof event.data?.id === 'string') known.add(event.data.id);
@@ -293,13 +352,13 @@ export function createSessionAdapter(ctx) {
     }
     const appended = [];
     const endSeq = () => live.snapshotEvents().at(-1)?.seq ?? -1;
-    if (pending.length === 0) return { sessionId, appended, skipped, endSeq: endSeq() };
+    if (pending.length === 0) return { sessionId, appended, skipped, endSeq: endSeq(), planChanged, todosChanged };
 
     let turn = latestTurn(events);
     let createdTurn = false;
     if (turn === undefined) {
       turn = 1;
-      live.append('turn/start', { turn });
+      live.append('turn/start', { turn, source: 'codex' });
       syntheticTurns.add(turn);
       createdTurn = true;
     }
@@ -322,8 +381,8 @@ export function createSessionAdapter(ctx) {
       live.append('step/end', { turn, step });
       step++;
     }
-    if (createdTurn) live.append('turn/end', { turn, reason: { kind: 'completed' } });
-    return { sessionId, turn, appended, skipped, endSeq: endSeq() };
+    if (createdTurn) live.append('turn/end', { turn, reason: { kind: 'completed' }, source: 'codex' });
+    return { sessionId, turn, appended, skipped, endSeq: endSeq(), planChanged, todosChanged };
   }
 
   return {
@@ -331,7 +390,7 @@ export function createSessionAdapter(ctx) {
       const args = object(input ?? {});
       switch (method) {
         case 'health': return { name: 'dsh-codex-bridge', version: '0.2.0', protocol: 1, platform: process.platform,
-          capabilities: ['create', 'send', 'sync', 'wait', 'cancel', 'workspaces', 'list', 'mirror'],
+          capabilities: ['create', 'send', 'sync', 'wait', 'cancel', 'workspaces', 'list', 'mirror', 'transcript', 'plan', 'todos'],
           idlePush: false, waiting: 'local-events', tokenPolicy: 'Waiting/sync makes no additional model calls; delegated tasks use the App model normally' };
         case 'workspaces': return { items: ctx.workspaceRegistry.list().map(w => ({ id: w.id, title: w.title, path: w.path })) };
         case 'list': {
@@ -375,6 +434,7 @@ export function createSessionAdapter(ctx) {
         }
         case 'cancel': return { ...await api.cancel({ sessionId: string(args.sessionId, 'sessionId') }), note: 'Cancels the active turn; queued messages are retained by DeepSeek Harness.' };
         case 'mirror': return mirror(args);
+        case 'transcript': return await transcript(args, signal);
         case 'sync': return await sync(args, signal);
         case 'wait': return await wait(args, signal);
         default: throw new BridgeError('METHOD_NOT_FOUND', `Unknown bridge method: ${method}`);

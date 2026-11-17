@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile, copyFile, rename } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile, copyFile, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -43,6 +43,54 @@ export async function addMarketplace(home, source) {
   return file;
 }
 
+const CODEX_HOOKS = [
+  { event: 'UserPromptSubmit', statusMessage: '同步 DeepSeek 对话更新' },
+  { event: 'SessionStart', statusMessage: '关联 DeepSeek 对话' },
+];
+
+async function exists(path) { try { await access(path); return true; } catch { return false; } }
+
+async function hookNode(app) {
+  if (app) {
+    const resources = process.platform === 'darwin'
+      ? join(app, 'Contents', 'Resources')
+      : join(app, '..', 'resources');
+    const candidate = join(resources, 'runtime', 'primary-runtime', 'dependencies', 'node',
+      process.platform === 'win32' ? 'node.exe' : 'bin/node');
+    if (await exists(candidate)) return candidate;
+  }
+  return process.execPath;
+}
+
+// Codex currently surfaces only user-level hooks in its trust review; hooks
+// declared inside a local plugin are not listed by hooks/list. Install the same
+// command into ~/.codex/hooks.json so both events appear and can be trusted.
+export async function installCodexHooks(home, nodePath, scriptPath) {
+  const file = join(home, '.codex', 'hooks.json');
+  let data = {};
+  let existing = false;
+  try { data = JSON.parse(await readFile(file, 'utf8')); existing = true; }
+  catch (error) { if (error.code !== 'ENOENT') throw new Error(`Cannot read ${file}: ${error.message}`); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(`${file} must contain a JSON object`);
+  data.hooks ??= {};
+  if (typeof data.hooks !== 'object' || Array.isArray(data.hooks)) throw new Error(`${file} has an invalid hooks field`);
+  data.description ??= 'DeepSeek Harness prompt sync (user-level fallback)';
+  const command = `"${nodePath}" "${scriptPath}"`;
+  for (const { event, statusMessage } of CODEX_HOOKS) {
+    const groups = data.hooks[event] ??= [];
+    if (!Array.isArray(groups)) throw new Error(`${file} has an invalid ${event} field`);
+    const present = groups.some(group => Array.isArray(group?.hooks)
+      && group.hooks.some(hook => typeof hook?.command === 'string' && hook.command.includes(scriptPath)));
+    if (!present) groups.push({ hooks: [{ type: 'command', command, timeout: 5, statusMessage }] });
+  }
+  await mkdir(dirname(file), { recursive: true });
+  if (existing) await copyFile(file, `${file}.backup-${Date.now()}-${randomUUID().slice(0, 6)}`);
+  const temp = `${file}.${randomUUID()}.tmp`;
+  await writeFile(temp, `${JSON.stringify(data, null, 2)}\n`, { flag: 'wx' });
+  await rename(temp, file);
+  return file;
+}
+
 async function doctor() {
   const report = { node: process.version, platform: process.platform };
   try { report.app = (await locateApp()).app; }
@@ -74,9 +122,13 @@ export async function main(args = process.argv.slice(2)) {
   if (flags.has('--all') || flags.has('--codex')) {
     actions.push({ action: 'Add personal Codex marketplace entry', plugin: pluginRoot });
     if (!flags.has('--dry-run')) await addMarketplace(homedir(), pluginRoot);
+    const app = await locateApp().catch(() => null);
+    const nodePath = await hookNode(app?.app);
+    actions.push({ action: 'Install user-level Codex hooks', file: join(homedir(), '.codex', 'hooks.json'), events: CODEX_HOOKS.map(item => item.event) });
+    if (!flags.has('--dry-run')) await installCodexHooks(homedir(), nodePath, join(pluginRoot, 'hooks', 'sync.mjs'));
   }
   console.log(JSON.stringify({ dryRun: flags.has('--dry-run'), actions }, null, 2));
-  if (!flags.has('--dry-run')) console.log('Open DeepSeek Harness. Restart Codex, then install DeepSeek Harness from your personal local plugin source. Review and trust its sync hook to enable automatic next-prompt sync.');
+  if (!flags.has('--dry-run')) console.log('Open DeepSeek Harness. Restart Codex, then install DeepSeek Harness from your personal local plugin source. Review and trust the UserPromptSubmit and SessionStart hooks to enable automatic next-prompt sync and workspace linking.');
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

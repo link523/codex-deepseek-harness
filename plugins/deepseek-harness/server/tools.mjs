@@ -6,15 +6,16 @@ const session = { sessionId: text('DeepSeek Harness session ID') };
 const sync = {
   ...session,
   afterSeq: int(-1, Number.MAX_SAFE_INTEGER, 'Exclusive event cursor; -1 reads from the beginning'),
+  codexSessionId: text('Current Codex session ID from the hook; supply to acknowledge contiguous reads and avoid automatic re-import'),
   limit: int(1, 500, 'Maximum returned events; default 100'),
   maxChars: int(1000, 100000, 'Maximum approximate event JSON characters; default 16000'),
   includeTools: { type: 'boolean', description: 'Include tool details; default false to save context' },
 };
-function tool(name, description, properties = {}, required = [], readOnly = true, delegates = false) {
+function tool(name, description, properties = {}, required = [], readOnly = true, destructive = false, openWorld = destructive) {
   const opensApp = name !== 'dsh_unbind';
-  return { name, description: name === 'dsh_unbind' ? description : `${description} Automatically opens the installed desktop App if it is not running and waits for its bridge.`,
+  return { name, description: opensApp ? `${description} Automatically opens the installed desktop App if it is not running and waits for its bridge.` : description,
     inputSchema: { type: 'object', properties, required, additionalProperties: false },
-    annotations: { readOnlyHint: readOnly && !opensApp, destructiveHint: delegates, openWorldHint: delegates } };
+    annotations: { readOnlyHint: readOnly && !opensApp, destructiveHint: destructive, openWorldHint: openWorld } };
 }
 export const tools = [
   tool('dsh_status', 'Check the local DeepSeek Harness desktop bridge, capabilities and sync limitations.'),
@@ -43,6 +44,11 @@ export const tools = [
   tool('dsh_unbind', 'Stop automatic next-prompt import and Codex record mirroring for this Codex session.', {
     codexSessionId: text('Current Codex session ID'),
   }, ['codexSessionId'], false),
+  tool('dsh_transcript', 'Read a linked DeepSeek conversation as one Markdown document. Use dsh_sync with a saved cursor for incremental updates to avoid re-reading history. Tool details are omitted unless explicitly requested.', {
+    ...session,
+    maxChars: int(1000, 500000, 'Maximum Markdown characters; default 200000'),
+    includeTools: { type: 'boolean', description: 'Include tool call/result details; default false to save context' },
+  }, ['sessionId']),
 ];
 
 export function validate(name, args) {
@@ -65,8 +71,24 @@ export function validate(name, args) {
 export async function callTool(client, name, args, signal) {
   validate(name, args);
   switch (name) {
-    case 'dsh_bind': return await bind(client, args.codexSessionId, args.sessionId, args.fromStart);
+    case 'dsh_bind': return await bind(client, args.codexSessionId, args.sessionId,
+      { fromStart: args.fromStart === true, mirrorFromStart: args.fromStart === true });
     case 'dsh_unbind': await writeLink(args.codexSessionId, null); return { unbound: true };
+    case 'dsh_transcript': return await client.call('transcript', args, { signal, timeoutMs: 45000 });
+    case 'dsh_sync':
+    case 'dsh_wait': {
+      const { codexSessionId, ...request } = args;
+      // Read the binding before the request so a concurrent rebind cannot cause
+      // this response to acknowledge history in a different conversation.
+      const link = codexSessionId ? await readLink(codexSessionId) : null;
+      const result = await client.call(name === 'dsh_sync' ? 'sync' : 'wait', request,
+        { signal, timeoutMs: name === 'dsh_wait' ? (args.timeoutMs ?? 50000) + 10000 : 45000 });
+      if (link?.sessionId === args.sessionId && result.sessionId === args.sessionId
+        && Number.isSafeInteger(result.cursor) && result.cursor >= (args.afterSeq ?? -1)) {
+        await commitCursor(codexSessionId, link, result.cursor, args.afterSeq ?? -1);
+      }
+      return result;
+    }
     default: {
       const methods = { dsh_status: 'health', dsh_workspaces: 'workspaces', dsh_list_sessions: 'list',
         dsh_create_session: 'create', dsh_send: 'send', dsh_sync: 'sync', dsh_wait: 'wait', dsh_cancel: 'cancel' };
@@ -81,5 +103,5 @@ export async function syncLinked(client, codexSessionId) {
   const result = await client.call('sync', { sessionId: link.sessionId, afterSeq: link.cursor, maxChars: 8000, limit: 50 }, { timeoutMs: 2000 });
   // Returning an additionalContext packet is the hook's delivery boundary.
   // No model is called here, and empty packets are omitted by the hook.
-  return { result, commit: () => commitCursor(codexSessionId, link, result.cursor) };
+  return { result, link, commit: () => commitCursor(codexSessionId, link, result.cursor) };
 }

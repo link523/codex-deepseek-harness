@@ -37,7 +37,7 @@ test('tool validation rejects extra fields and requires idempotency IDs for send
   assert.throws(() => validate('dsh_send', { sessionId: 's', text: 'hello' }), /requestId/);
   assert.throws(() => validate('dsh_status', { shell: 'anything' }), /Unknown argument/);
   assert.throws(() => validate('dsh_wait', { sessionId: 's', timeoutMs: 600001 }), /integer/);
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 11);
 });
 
 test('conversation binding and hook import only deltas, isolate Codex chats and never call a model', async () => {
@@ -70,7 +70,8 @@ test('conversation binding and hook import only deltas, isolate Codex chats and 
 });
 
 test('stdio MCP negotiates, validates and responds to concurrent JSONL requests', async t => {
-  const child = spawn(process.execPath, ['plugins/deepseek-harness/server/index.mjs'], { cwd: resolve('.'), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const child = spawn(process.execPath, ['plugins/deepseek-harness/server/index.mjs'], { cwd: resolve('.'), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    env: { ...process.env, DSH_CODEX_CONNECTION_FILE: join(tmpdir(), `missing-${process.pid}.json`) } });
   t.after(() => { child.kill(); });
   const messages = []; let pending = '';
   child.stdout.on('data', chunk => {
@@ -85,16 +86,21 @@ test('stdio MCP negotiates, validates and responds to concurrent JSONL requests'
     'invalid-json',
     JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'ping' }),
     JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: null }),
+    JSON.stringify({ jsonrpc: '2.0', id: 6, method: 'resources/templates/list' }),
+    JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'resources/list' }),
     '',
   ].join('\n'));
   const deadline = Date.now() + 4000;
-  while (messages.length < 6 && Date.now() < deadline) await new Promise(done => setTimeout(done, 10));
+  while (messages.length < 8 && Date.now() < deadline) await new Promise(done => setTimeout(done, 10));
   assert.equal(messages.find(m => m.id === 1).result.protocolVersion, '2025-06-18');
-  assert.equal(messages.find(m => m.id === 2).result.tools.length, 10);
+  assert.equal(messages.find(m => m.id === 2).result.tools.length, 11);
   assert.equal(messages.find(m => m.id === 3).result.isError, true);
   assert.equal(messages.find(m => m.id === null).error.code, -32700);
   assert.deepEqual(messages.find(m => m.id === 4).result, {});
   assert.equal(messages.find(m => m.id === 5).error.code, -32602);
+  assert.equal(messages.find(m => m.id === 6).result.resourceTemplates.length, 1);
+  assert.deepEqual(messages.find(m => m.id === 7).result.resources, []);
+  assert.ok(messages.find(m => m.id === 1).result.capabilities.resources);
   child.stdin.end(); await once(child, 'exit');
 });
 

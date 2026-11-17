@@ -7,6 +7,14 @@
         "timeout": 5,
         "statusMessage": "同步 DeepSeek 对话更新"
       }]
+    }],
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "node \"${PLUGIN_ROOT}/hooks/sync.mjs\"",
+        "timeout": 5,
+        "statusMessage": "关联 DeepSeek 对话"
+      }]
     }]
   }
 }

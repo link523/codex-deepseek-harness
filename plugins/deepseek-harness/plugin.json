@@ -6,8 +6,7 @@
   "extensions": {
     "com.openai": {
       "requires_local_executor": true,
-      "hooks": "./hooks/hooks.json",
-      "interface": {
+          "interface": {
         "displayName": "DeepSeek Harness",
         "shortDescription": "控制桌面 App、执行任务并同步对话",
         "defaultPrompt": "让 DeepSeek Harness 在指定项目中执行任务，并把结果同步到当前对话。"

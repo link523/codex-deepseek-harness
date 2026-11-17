@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixture } from './fixture.mjs';
 import { createSessionAdapter } from '../plugins/deepseek-harness/bridge/session-adapter.mjs';
-import { createMirrorWatcher, mirrorKey, mirrorStateFile, transcriptMessages } from '../plugins/deepseek-harness/bridge/mirror.mjs';
+import { createMirrorWatcher, mirrorKey, mirrorStateFile, transcriptMessages, transcriptRecords } from '../plugins/deepseek-harness/bridge/mirror.mjs';
 
 let ordinal = 0;
 const line = (type, payload) => JSON.stringify({ timestamp: '2026-11-02T08:00:00.000Z', ordinal: ordinal++, type, payload });
@@ -65,7 +65,7 @@ test('mirror appends renderable DeepSeek events, deduplicates by Codex ID and ne
     'step/start', 'assistant/message', 'step/end',
     'turn/end',
   ]);
-  assert.deepEqual(events[0].data, { turn: 1 });
+  assert.deepEqual(events[0].data, { turn: 1, source: 'codex' });
   assert.equal(events[1].data.source.kind, 'user');
   assert.equal(events[1].data.source.mirror, 'codex');
   assert.deepEqual(events[1].data.content, [{ type: 'text', text: '来自 Codex 的提问' }]);
@@ -75,7 +75,7 @@ test('mirror appends renderable DeepSeek events, deduplicates by Codex ID and ne
   assert.equal(events[3].data.stream.length, 0);
   assert.equal(events[3].data.message.source.provider, 'codex');
   assert.equal(events[3].data.message.source.model, 'gpt-6-luna');
-  assert.deepEqual(events.at(-1).data, { turn: 1, reason: { kind: 'completed' } });
+  assert.deepEqual(events.at(-1).data, { turn: 1, reason: { kind: 'completed' }, source: 'codex' });
 
   const again = await adapter.call('mirror', { sessionId, messages });
   assert.deepEqual(again.appended, []);
@@ -85,6 +85,12 @@ test('mirror appends renderable DeepSeek events, deduplicates by Codex ID and ne
   // Mirrored records are DeepSeek history, not something to send back to Codex.
   const result = await adapter.call('sync', { sessionId });
   assert.deepEqual(result.entries.map(entry => entry.type), []);
+
+  // A restart loses the in-memory synthetic-turn set; the persisted source
+  // marker must still keep imported boundaries out of DSH -> Codex sync.
+  const restarted = createSessionAdapter(f.ctx);
+  const afterRestart = await restarted.call('sync', { sessionId });
+  assert.deepEqual(afterRestart.entries.map(entry => entry.type), []);
 });
 
 test('mirror reuses the latest turn and keeps imported steps clear of real steps', async () => {
@@ -176,4 +182,77 @@ test('links to closed conversations are skipped without reading or failing', asy
   t.after(async () => { watcher.stop(); await rm(dir, { recursive: true, force: true }); });
   await watcher.tick();
   await assert.rejects(readFile(mirrorStateFile(root, 'codex-closed\u0000closed'), 'utf8'), error => error.code === 'ENOENT');
+});
+
+test('Codex plan, todo and model records are extracted from the transcript', () => {
+  const records = transcriptRecords([
+    line('turn_context', { model: 'gpt-6-luna', collaboration_mode: { mode: 'plan' } }),
+    line('response_item', { type: 'function_call', name: 'update_plan', arguments: JSON.stringify({
+      plan: [{ step: 'inspect', status: 'in_progress' }, { step: 'edit' }],
+    }) }),
+    line('event_msg', { type: 'thread_settings_applied', thread_settings: { model: 'gpt-6-luna', collaboration_mode: { mode: 'default' } } }),
+  ]);
+  assert.equal(records.planMode, false);
+  assert.equal(records.model, 'gpt-6-luna');
+  assert.deepEqual(records.todos, [
+    { content: 'inspect', status: 'in_progress' },
+    { content: 'edit', status: 'pending' },
+  ]);
+});
+
+test('mirror appends plan mode and todo snapshots once', async () => {
+  const f = fixture();
+  const { sessionId } = await f.ctx.sessionController.create({ cwd: '/tmp' });
+  const adapter = createSessionAdapter(f.ctx);
+  const first = await adapter.call('mirror', { sessionId, messages: [], planMode: true,
+    todos: [{ content: 'write tests', status: 'pending' }] });
+  assert.equal(first.planChanged, true);
+  assert.equal(first.todosChanged, true);
+  assert.deepEqual(f.sessions.get(sessionId).events.map(event => event.type), ['plan/mode', 'todo/write']);
+  const again = await adapter.call('mirror', { sessionId, messages: [], planMode: true,
+    todos: [{ content: 'write tests', status: 'pending' }] });
+  assert.equal(again.planChanged, false);
+  assert.equal(again.todosChanged, false);
+  assert.equal(f.sessions.get(sessionId).events.length, 2);
+});
+
+test('transcript renders a linked conversation as Markdown and omits mirrored records', async () => {
+  const f = fixture();
+  const { sessionId } = await f.ctx.sessionController.create({ cwd: '/tmp' });
+  f.append(sessionId, 'user/message', { id: 'u1', role: 'user', content: [{ type: 'text', text: 'hello' }] });
+  f.append(sessionId, 'assistant/message', { turn: 1, step: 1, stream: [],
+    message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'world' }] } });
+  f.append(sessionId, 'tool/call', { turn: 1, step: 1, callId: 'c1', name: 'exec', arguments: '{"cmd":"ls"}' });
+  const adapter = createSessionAdapter(f.ctx);
+  const result = await adapter.call('transcript', { sessionId });
+  assert.match(result.markdown, /^# DeepSeek Harness conversation/m);
+  assert.match(result.markdown, /\*\*User\*\*\n\nhello/);
+  assert.match(result.markdown, /\*\*Assistant\*\*\n\nworld/);
+  assert.match(result.markdown, /Tool call/);
+  const withoutTools = await adapter.call('transcript', { sessionId, includeTools: false });
+  assert.doesNotMatch(withoutTools.markdown, /Tool call/);
+  await adapter.call('mirror', { sessionId, messages: [{ id: 'codex-1', role: 'user', text: 'mirrored' }] });
+  const after = await adapter.call('transcript', { sessionId });
+  assert.doesNotMatch(after.markdown, /mirrored/);
+});
+
+test('watcher only pushes plan changes so a DeepSeek toggle is not overwritten', async t => {
+  const e = await mirrorEnvironment(t, { fromStart: true, initial: [line('turn_context', { collaboration_mode: { mode: 'default' } })] });
+  await e.watcher.tick();
+  const session = e.f.sessions.get(e.sessionId);
+  assert.equal(session.events.filter(event => event.type === 'plan/mode').length, 0);
+
+  // The user turns plan mode on inside DeepSeek; an unchanged Codex snapshot
+  // must not push it back off on the next poll.
+  e.f.append(e.sessionId, 'plan/mode', { active: true });
+  await e.watcher.tick();
+  assert.equal(session.events.filter(event => event.type === 'plan/mode').at(-1).data.active, true);
+
+  await appendFile(e.transcript, `${line('turn_context', { collaboration_mode: { mode: 'plan' } })}\n`);
+  await e.watcher.tick();
+  assert.equal(session.events.filter(event => event.type === 'plan/mode').length, 1);
+
+  await appendFile(e.transcript, `${line('turn_context', { collaboration_mode: { mode: 'default' } })}\n`);
+  await e.watcher.tick();
+  assert.equal(session.events.filter(event => event.type === 'plan/mode').at(-1).data.active, false);
 });

@@ -55,20 +55,29 @@ async function updateLink(codexSessionId, update) {
 export async function writeLink(codexSessionId, link) {
   await updateLink(codexSessionId, () => link);
 }
-export async function commitCursor(codexSessionId, expected, cursor) {
+export async function commitCursor(codexSessionId, expected, cursor, afterSeq = expected.cursor) {
   if (!Number.isSafeInteger(cursor) || cursor < -1) throw new Error('Invalid sync cursor');
+  if (!Number.isSafeInteger(afterSeq) || afterSeq < -1) throw new Error('Invalid sync start cursor');
   await updateLink(codexSessionId, current => {
     if (!current || current.bindingId !== expected.bindingId || current.sessionId !== expected.sessionId
       || current.linkedAt !== expected.linkedAt) return;
+    // A page may overlap delivered history, but must not skip an unread gap.
+    // Check under the same lock as the binding identity and cursor update.
+    if (afterSeq > current.cursor) return;
     if (cursor > current.cursor) return { ...current, cursor };
   });
 }
-export async function bind(client, codexSessionId, sessionId, fromStart = false) {
-  const snapshot = await client.call('sync', { sessionId, afterSeq: -1, limit: 1 });
+export async function bind(client, codexSessionId, sessionId, options = {}) {
+  // Older callers pass a boolean fourth argument; keep that form working.
+  if (options === true) options = { fromStart: true };
+  else if (options === false || options === undefined || options === null) options = {};
+  const fromStart = options.fromStart === true;
+  const mirrorFromStart = options.mirrorFromStart === undefined ? fromStart : options.mirrorFromStart === true;
+  const snapshot = await client.call('sync', { sessionId, afterSeq: -1, limit: 1 }, { timeoutMs: options.timeoutMs ?? 45000 });
   // codexSessionId and mirrorFromStart let the bridge extension locate the Codex
   // transcript and mirror its records into this conversation. Cursor matching in
   // commitCursor still uses bindingId/sessionId/linkedAt only.
-  const link = { sessionId, codexSessionId, mirrorFromStart: fromStart === true,
+  const link = { sessionId, codexSessionId, mirrorFromStart,
     bindingId: randomUUID(), cursor: fromStart ? -1 : snapshot.endSeq, linkedAt: new Date().toISOString() };
   await writeLink(codexSessionId, link);
   return link;

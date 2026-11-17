@@ -1,3 +1,12 @@
+# Unreleased
+
+- 新增 `dsh_transcript`：把 DSH 会话渲染成 Markdown（消息、工具摘要、计划、待办、模型），过滤 Codex 镜像记录，避免回环。
+- 新增 MCP resources：`dsh://session/{sessionId}`，支持 `resources/list`、`resources/templates/list`、`resources/read`，Codex 可按需读取完整 DSH 对话。
+- 新增按工作区自动关联：`UserPromptSubmit` / `SessionStart` 在 `cwd` 唯一且 30 分钟内有活动时自动 `dsh_bind`；两个空闲候选过近时保持未绑定，避免乱绑。
+- Codex → DSH 镜像新增计划/待办：解析 `update_plan`、`Plan` item 与 `collaboration_mode`，追加 `plan/mode`、`todo/write`；镜像助手消息的 source 记录 Codex 模型，不改写 DSH 模型选择。
+- `UserPromptSubmit` 注入内容改为紧凑 Markdown digest，包含消息、计划、待办和模型，不再注入原始 JSON。
+- 新增 `tests/auto-bind.test.mjs`，并补充 plan/todo、transcript、MCP resources 测试；总计 57 项。
+
 # 0.2.0 · 2026-11-02
 
 - 新增 Codex → DeepSeek 记录镜像：`dsh_bind` 记录 Codex 会话 ID，配套扩展尾随对应转录文件，把真实的用户提问和助手回复追加到已打开的 DeepSeek 会话，实现双向记录同步。
